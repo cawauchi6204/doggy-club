@@ -1,0 +1,90 @@
+services:
+  - type: web
+    name: doggie-pass-backend
+    env: go
+    buildCommand: go build -o main ./cmd/api
+    startCommand: ./main
+    envVars:
+      - key: ENV
+        value: production
+      - key: PORT
+        value: 8080
+      - key: DB_SSL_MODE
+        value: require
+      - key: DB_HOST
+        fromDatabase:
+          name: doggie-pass-postgres
+          property: host
+      - key: DB_PORT
+        fromDatabase:
+          name: doggie-pass-postgres
+          property: port
+      - key: DB_NAME
+        fromDatabase:
+          name: doggie-pass-postgres
+          property: database
+      - key: DB_USER
+        fromDatabase:
+          name: doggie-pass-postgres
+          property: user
+      - key: DB_PASSWORD
+        fromDatabase:
+          name: doggie-pass-postgres
+          property: password
+      - key: REDIS_HOST
+        fromService:
+          type: redis
+          name: doggie-pass-redis
+          property: host
+      - key: REDIS_PORT
+        fromService:
+          type: redis
+          name: doggie-pass-redis
+          property: port
+      - key: REDIS_PASSWORD
+        fromService:
+          type: redis
+          name: doggie-pass-redis
+          property: password
+      - key: JWT_SECRET
+        generateValue: true
+      - key: JWT_EXPIRE_HOURS
+        value: 24
+      - key: JWT_REFRESH_EXPIRE_HOURS
+        value: 168
+      - key: CLOUDFLARE_R2_ACCESS_KEY
+        sync: false
+      - key: CLOUDFLARE_R2_SECRET_KEY
+        sync: false
+      - key: CLOUDFLARE_R2_BUCKET
+        sync: false
+      - key: CLOUDFLARE_R2_ENDPOINT
+        sync: false
+      - key: FIREBASE_CREDENTIALS_PATH
+        value: /opt/render/project/src/firebase-credentials.json
+      - key: FIREBASE_PROJECT_ID
+        sync: false
+      - key: STRIPE_SECRET_KEY
+        sync: false
+      - key: STRIPE_WEBHOOK_SECRET
+        sync: false
+      - key: GOOGLE_MAPS_API_KEY
+        sync: false
+      - key: ENABLE_ENCOUNTER_DETECTION
+        value: true
+      - key: ENABLE_PUSH_NOTIFICATIONS
+        value: true
+      - key: ENABLE_PREMIUM_FEATURES
+        value: true
+    healthCheckPath: /health
+
+  - type: redis
+    name: doggie-pass-redis
+    plan: starter
+    maxmemoryPolicy: allkeys-lru
+
+databases:
+  - name: doggie-pass-postgres
+    databaseName: doggie_pass
+    user: doggie_pass_user
+    plan: starter

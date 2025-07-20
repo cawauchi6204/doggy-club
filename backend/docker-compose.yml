@@ -1,0 +1,95 @@
+
+services:
+  # Main application
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: doggie-pass-backend-dev
+    restart: unless-stopped
+    ports:
+      - "9090:9090"
+    environment:
+      - ENV=development
+      - PORT=9090
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_NAME=doggie_pass_dev
+      - DB_USER=doggie_pass_user
+      - DB_PASSWORD=password123
+      - DB_SSL_MODE=disable
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_PASSWORD=
+      - JWT_SECRET=your-secret-key-change-me
+      - JWT_EXPIRE_HOURS=24
+      - JWT_REFRESH_EXPIRE_HOURS=168
+      - ENABLE_ENCOUNTER_DETECTION=true
+      - ENABLE_PUSH_NOTIFICATIONS=false
+      - ENABLE_PREMIUM_FEATURES=false
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - doggie-pass-network
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:9090/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # PostgreSQL database
+  postgres:
+    image: postgres:15-alpine
+    container_name: doggie-pass-postgres-dev
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: doggie_pass_dev
+      POSTGRES_USER: doggie_pass_user
+      POSTGRES_PASSWORD: password123
+      POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init-db.sql:/docker-entrypoint-initdb.d/init-db.sql:ro
+    ports:
+      - "5432:5432"
+    networks:
+      - doggie-pass-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U doggie_pass_user -d doggie_pass_dev"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # Redis cache
+  redis:
+    image: redis:7-alpine
+    container_name: doggie-pass-redis-dev
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6380:6379"
+    networks:
+      - doggie-pass-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "--raw", "incr", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+
+networks:
+  doggie-pass-network:
+    driver: bridge
