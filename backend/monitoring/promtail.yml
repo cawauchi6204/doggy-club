@@ -1,0 +1,148 @@
+server:
+  http_listen_port: 9080
+  grpc_listen_port: 0
+
+positions:
+  filename: /tmp/positions.yaml
+
+clients:
+  - url: http://loki:3100/loki/api/v1/push
+
+scrape_configs:
+  # DoggyClub Backend logs
+  - job_name: doggyclub-backend
+    static_configs:
+      - targets:
+          - localhost
+        labels:
+          job: doggyclub-backend
+          __path__: /var/log/doggyclub/*.log
+    pipeline_stages:
+      - match:
+          selector: '{job="doggyclub-backend"}'
+          stages:
+            - json:
+                expressions:
+                  level: level
+                  timestamp: timestamp
+                  message: message
+                  trace_id: trace_id
+                  user_id: user_id
+            - labels:
+                level:
+                trace_id:
+                user_id:
+            - timestamp:
+                source: timestamp
+                format: RFC3339
+
+  # Nginx access logs
+  - job_name: nginx-access
+    static_configs:
+      - targets:
+          - localhost
+        labels:
+          job: nginx-access
+          __path__: /var/log/nginx/access.log
+    pipeline_stages:
+      - match:
+          selector: '{job="nginx-access"}'
+          stages:
+            - regex:
+                expression: '^(?P<remote_addr>\S+) - (?P<remote_user>\S+) \[(?P<time_local>[^\]]+)\] "(?P<method>\S+) (?P<path>\S+) (?P<protocol>\S+)" (?P<status>\d+) (?P<body_bytes_sent>\d+) "(?P<http_referer>[^"]*)" "(?P<http_user_agent>[^"]*)" "(?P<http_x_forwarded_for>[^"]*)" rt=(?P<request_time>\S+) uct="(?P<upstream_connect_time>\S*)" uht="(?P<upstream_header_time>\S*)" urt="(?P<upstream_response_time>\S*)"'
+            - labels:
+                method:
+                status:
+                path:
+            - timestamp:
+                source: time_local
+                format: 02/Jan/2006:15:04:05 -0700
+
+  # Nginx error logs
+  - job_name: nginx-error
+    static_configs:
+      - targets:
+          - localhost
+        labels:
+          job: nginx-error
+          __path__: /var/log/nginx/error.log
+    pipeline_stages:
+      - match:
+          selector: '{job="nginx-error"}'
+          stages:
+            - regex:
+                expression: '^(?P<timestamp>\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}) \[(?P<level>\w+)\] (?P<pid>\d+)#(?P<tid>\d+): (?P<message>.*)'
+            - labels:
+                level:
+                pid:
+            - timestamp:
+                source: timestamp
+                format: 2006/01/02 15:04:05
+
+  # PostgreSQL logs (if available)
+  - job_name: postgres
+    static_configs:
+      - targets:
+          - localhost
+        labels:
+          job: postgres
+          __path__: /var/log/postgresql/*.log
+    pipeline_stages:
+      - match:
+          selector: '{job="postgres"}'
+          stages:
+            - regex:
+                expression: '^(?P<timestamp>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3}) \w{3} \[(?P<pid>\d+)\] (?P<level>\w+):  (?P<message>.*)'
+            - labels:
+                level:
+                pid:
+            - timestamp:
+                source: timestamp
+                format: 2006-01-02 15:04:05.000
+
+  # Redis logs (if available)
+  - job_name: redis
+    static_configs:
+      - targets:
+          - localhost
+        labels:
+          job: redis
+          __path__: /var/log/redis/*.log
+    pipeline_stages:
+      - match:
+          selector: '{job="redis"}'
+          stages:
+            - regex:
+                expression: '^(?P<pid>\d+):(?P<role>\w) (?P<timestamp>\d{2} \w{3} \d{4} \d{2}:\d{2}:\d{2}\.\d{3}) (?P<level>\w) (?P<message>.*)'
+            - labels:
+                level:
+                role:
+                pid:
+            - timestamp:
+                source: timestamp
+                format: 02 Jan 2006 15:04:05.000
+
+  # Docker container logs
+  - job_name: docker
+    docker_sd_configs:
+      - host: unix:///var/run/docker.sock
+        refresh_interval: 5s
+    relabel_configs:
+      - source_labels: ['__meta_docker_container_name']
+        regex: '/(.*)'
+        target_label: 'container'
+      - source_labels: ['__meta_docker_container_log_stream']
+        target_label: 'stream'
+    pipeline_stages:
+      - docker: {}
+      - match:
+          selector: '{container="doggyclub-backend"}'
+          stages:
+            - json:
+                expressions:
+                  level: level
+                  message: message
+                  trace_id: trace_id
+            - labels:
+                level:
+                trace_id:

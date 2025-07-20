@@ -1,0 +1,61 @@
+version: '3.8'
+
+services:
+  # Test PostgreSQL database
+  test-postgres:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_DB: doggyclub_test
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password
+    ports:
+      - "5433:5432"
+    volumes:
+      - test_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Test Redis
+  test-redis:
+    image: redis:7-alpine
+    ports:
+      - "6380:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Test runner
+  test-runner:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    environment:
+      - TEST_DB_HOST=test-postgres
+      - TEST_DB_PORT=5432
+      - TEST_DB_NAME=doggyclub_test
+      - TEST_DB_USER=postgres
+      - TEST_DB_PASSWORD=password
+      - TEST_REDIS_HOST=test-redis
+      - TEST_REDIS_PORT=6379
+      - GO_ENV=test
+    depends_on:
+      test-postgres:
+        condition: service_healthy
+      test-redis:
+        condition: service_healthy
+    volumes:
+      - .:/app
+      - go_mod_cache:/go/pkg/mod
+      - go_build_cache:/root/.cache/go-build
+    working_dir: /app
+    command: make test-full-in-docker
+
+volumes:
+  test_postgres_data:
+  go_mod_cache:
+  go_build_cache:

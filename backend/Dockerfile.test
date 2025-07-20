@@ -1,0 +1,34 @@
+# Test Dockerfile for running tests in container
+FROM golang:1.21-alpine AS test
+
+# Install dependencies
+RUN apk add --no-cache \
+    git \
+    make \
+    postgresql-client \
+    redis
+
+# Install testing tools
+RUN go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest
+RUN go install github.com/securecodewarrior/gosec/v2/cmd/gosec@latest
+
+# Set working directory
+WORKDIR /app
+
+# Copy go mod files
+COPY go.mod go.sum ./
+
+# Download dependencies
+RUN go mod download
+
+# Copy source code
+COPY . .
+
+# Add test target to Makefile for Docker
+RUN echo "" >> Makefile && \
+    echo "test-full-in-docker: ## Run full test suite inside Docker" >> Makefile && \
+    echo "	@echo \"Running tests in Docker container...\"" >> Makefile && \
+    echo "	@go test -v -race -timeout=300s ./..." >> Makefile
+
+# Default command
+CMD ["make", "test-full-in-docker"]

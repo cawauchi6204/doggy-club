@@ -1,0 +1,483 @@
+package services
+
+import (
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/doggyclub/backend/config"
+	"github.com/doggyclub/backend/pkg/models"
+	"github.com/doggyclub/backend/pkg/utils"
+	"github.com/redis/go-redis/v9"
+	"gorm.io/gorm"
+)
+
+type QueryOptimizationService struct {
+	db           *gorm.DB
+	redis        *redis.Client
+	cfg          config.Config
+}
+
+func NewQueryOptimizationService(db *gorm.DB, redis *redis.Client, cfg config.Config) *QueryOptimizationService {
+	return &QueryOptimizationService{
+		db:           db,
+		redis:        redis,
+		cfg:          cfg,
+	}
+}
+
+// Optimized queries for frequent operations
+
+// GetUserWithDogs returns user with all their dogs (optimized with caching)
+func (s *QueryOptimizationService) GetUserWithDogs(userID string) (*models.User, error) {
+	// Try cache first
+	cacheKey := fmt.Sprintf("user_with_dogs:%s", userID)
+	var user models.User
+	if err := s.cacheService.Get(cacheKey, &user); err == nil {
+		return &user, nil
+	}
+
+	// Query database with optimized preloading
+	if err := s.db.Preload("Dogs", func(db *gorm.DB) *gorm.DB {
+		return db.Order("created_at DESC")
+	}).Where("id = ?", userID).First(&user).Error; err != nil {
+		return nil, utils.WrapError(err, "failed to get user with dogs")
+	}
+
+	// Cache result
+	s.cacheService.Set(cacheKey, user, MediumCacheDuration)
+
+	return &user, nil
+}
+
+// GetTimelineOptimized returns optimized timeline with batched queries
+func (s *QueryOptimizationService) GetTimelineOptimized(userID string, limit int, offset int) ([]models.Post, int64, error) {
+	// Try cache first
+	page := offset/limit + 1
+	cacheKey := fmt.Sprintf("timeline:%s:page:%d", userID, page)
+	
+	type TimelineResult struct {
+		Posts []models.Post `json:"posts"`
+		Total int64         `json:"total"`
+	}
+	
+	var cachedResult TimelineResult
+	if err := s.cacheService.Get(cacheKey, &cachedResult); err == nil {
+		return cachedResult.Posts, cachedResult.Total, nil
+	}
+
+	// Get followed dogs in batch
+	var followedDogIDs []string
+	s.db.Model(&models.Follower{}).Where("follower_dog_id IN (SELECT id FROM dogs WHERE user_id = ?)", userID).Pluck("followed_dog_id", &followedDogIDs)
+
+	// Get user's own dogs
+	var userDogIDs []string
+	s.db.Model(&models.Dog{}).Where("user_id = ?", userID).Pluck("id", &userDogIDs)
+
+	// Combine all dog IDs
+	allDogIDs := append(followedDogIDs, userDogIDs...)
+	if len(allDogIDs) == 0 {
+		return []models.Post{}, 0, nil
+	}
+
+	// Count total posts (cached separately for better performance)
+	var total int64
+	totalCacheKey := fmt.Sprintf("timeline_total:%s", userID)
+	if err := s.cacheService.Get(totalCacheKey, &total); err != nil {
+		if err := s.db.Model(&models.Post{}).Where("dog_id IN ? AND is_public = true", allDogIDs).Count(&total).Error; err != nil {
+			return nil, 0, utils.WrapError(err, "failed to count timeline posts")
+		}
+		s.cacheService.Set(totalCacheKey, total, ShortCacheDuration)
+	}
+
+	// Get posts with optimized preloading
+	var posts []models.Post
+	if err := s.db.Preload("Dog", func(db *gorm.DB) *gorm.DB {
+		return db.Select("id, name, profile_photo, user_id")
+	}).Select("id, dog_id, content, media_urls, media_type, likes_count, comments_count, created_at").
+		Where("dog_id IN ? AND is_public = true", allDogIDs).
+		Order("created_at DESC").
+		Limit(limit).Offset(offset).
+		Find(&posts).Error; err != nil {
+		return nil, 0, utils.WrapError(err, "failed to get timeline posts")
+	}
+
+	// Cache result
+	result := TimelineResult{Posts: posts, Total: total}
+	s.cacheService.Set(cacheKey, result, ShortCacheDuration)
+
+	return posts, total, nil
+}
+
+// GetPopularPostsOptimized returns popular posts with Redis caching
+func (s *QueryOptimizationService) GetPopularPostsOptimized(period string, limit int) ([]models.Post, error) {
+	// Try cache first
+	cacheKey := fmt.Sprintf("popular_posts:%s", period)
+	var posts []models.Post
+	if err := s.cacheService.Get(cacheKey, &posts); err == nil {
+		return posts, nil
+	}
+
+	// Calculate time range
+	var timeFilter time.Time
+	switch period {
+	case "daily":
+		timeFilter = time.Now().AddDate(0, 0, -1)
+	case "weekly":
+		timeFilter = time.Now().AddDate(0, 0, -7)
+	case "monthly":
+		timeFilter = time.Now().AddDate(0, -1, 0)
+	default:
+		timeFilter = time.Now().AddDate(-1, 0, 0) // Last year
+	}
+
+	// Optimized query for popular posts
+	if err := s.db.Preload("Dog", func(db *gorm.DB) *gorm.DB {
+		return db.Select("id, name, profile_photo, user_id")
+	}).Where("is_public = true AND created_at > ?", timeFilter).
+		Order("(likes_count * 2 + comments_count) DESC, created_at DESC").
+		Limit(limit).
+		Find(&posts).Error; err != nil {
+		return nil, utils.WrapError(err, "failed to get popular posts")
+	}
+
+	// Cache result
+	s.cacheService.Set(cacheKey, posts, MediumCacheDuration)
+
+	return posts, nil
+}
+
+// GetUserStatsOptimized returns cached user statistics
+func (s *QueryOptimizationService) GetUserStatsOptimized(userID string) (*UserStats, error) {
+	// Try cache first
+	cacheKey := fmt.Sprintf("user_stats:%s", userID)
+	var stats UserStats
+	if err := s.cacheService.Get(cacheKey, &stats); err == nil {
+		return &stats, nil
+	}
+
+	// Calculate stats with optimized queries
+	stats = UserStats{
+		UserID: userID,
+	}
+
+	// Get dog count
+	s.db.Model(&models.Dog{}).Where("user_id = ?", userID).Count(&stats.DogCount)
+
+	// Get post count
+	s.db.Table("posts").
+		Joins("JOIN dogs ON posts.dog_id = dogs.id").
+		Where("dogs.user_id = ?", userID).
+		Count(&stats.PostCount)
+
+	// Get total likes received
+	s.db.Table("likes").
+		Joins("JOIN posts ON likes.post_id = posts.id").
+		Joins("JOIN dogs ON posts.dog_id = dogs.id").
+		Where("dogs.user_id = ?", userID).
+		Count(&stats.LikesReceived)
+
+	// Get followers count
+	s.db.Table("follows").
+		Joins("JOIN dogs ON follows.dog_id = dogs.id").
+		Where("dogs.user_id = ?", userID).
+		Count(&stats.FollowersCount)
+
+	// Get following count
+	s.db.Model(&models.Follower{}).Where("follower_dog_id IN (SELECT id FROM dogs WHERE user_id = ?)", userID).Count(&stats.FollowingCount)
+
+	// Get encounter count
+	s.db.Model(&models.Encounter{}).Where("user1_id = ? OR user2_id = ?", userID, userID).Count(&stats.EncounterCount)
+
+	// Get gifts received count
+	s.db.Table("gifts").
+		Joins("JOIN dogs ON gifts.receiver_dog_id = dogs.id").
+		Where("dogs.user_id = ?", userID).
+		Count(&stats.GiftsReceived)
+
+	// Get gifts sent count
+	s.db.Table("gifts").
+		Joins("JOIN dogs ON gifts.sender_dog_id = dogs.id").
+		Where("dogs.user_id = ?", userID).
+		Count(&stats.GiftsSent)
+
+	// Cache stats
+	s.cacheService.Set(cacheKey, stats, MediumCacheDuration)
+
+	return &stats, nil
+}
+
+// BatchGetDogProfiles gets multiple dog profiles efficiently
+func (s *QueryOptimizationService) BatchGetDogProfiles(dogIDs []string) (map[string]*models.Dog, error) {
+	if len(dogIDs) == 0 {
+		return make(map[string]*models.Dog), nil
+	}
+
+	// Try to get from cache first
+	var cachedDogs map[string]*models.Dog
+	var missingIDs []string
+
+	// Check cache for each dog
+	for _, dogID := range dogIDs {
+		cacheKey := fmt.Sprintf("dog_profile:%s", dogID)
+		var dog models.Dog
+		if err := s.cacheService.Get(cacheKey, &dog); err == nil {
+			if cachedDogs == nil {
+				cachedDogs = make(map[string]*models.Dog)
+			}
+			cachedDogs[dogID] = &dog
+		} else {
+			missingIDs = append(missingIDs, dogID)
+		}
+	}
+
+	// Query missing dogs from database
+	if len(missingIDs) > 0 {
+		var dogs []models.Dog
+		if err := s.db.Where("id IN ?", missingIDs).Find(&dogs).Error; err != nil {
+			return nil, utils.WrapError(err, "failed to batch get dog profiles")
+		}
+
+		// Cache individual dogs and add to result
+		for _, dog := range dogs {
+			cacheKey := fmt.Sprintf("dog_profile:%s", dog.ID)
+			s.cacheService.Set(cacheKey, dog, MediumCacheDuration)
+			
+			if cachedDogs == nil {
+				cachedDogs = make(map[string]*models.Dog)
+			}
+			cachedDogs[dog.ID] = &dog
+		}
+	}
+
+	return cachedDogs, nil
+}
+
+// OptimizedSearch performs optimized search with full-text search and caching
+func (s *QueryOptimizationService) OptimizedSearch(query string, contentType string, limit int, offset int) (interface{}, int64, error) {
+	// Generate cache key
+	cacheKey := fmt.Sprintf("search:%s:%s:%d:%d", contentType, query, limit, offset)
+	
+	switch contentType {
+	case "posts":
+		return s.searchPosts(query, limit, offset, cacheKey)
+	case "dogs":
+		return s.searchDogs(query, limit, offset, cacheKey)
+	case "users":
+		return s.searchUsers(query, limit, offset, cacheKey)
+	default:
+		return nil, 0, utils.NewAPIError("INVALID_CONTENT_TYPE", "Invalid content type for search", nil)
+	}
+}
+
+// Optimized counting with estimated counts for large tables
+func (s *QueryOptimizationService) GetEstimatedCount(tableName string, condition string, args ...interface{}) (int64, error) {
+	cacheKey := fmt.Sprintf("estimated_count:%s:%s", tableName, condition)
+	
+	var count int64
+	if err := s.cacheService.Get(cacheKey, &count); err == nil {
+		return count, nil
+	}
+
+	// For large tables, use estimated count
+	if s.isLargeTable(tableName) {
+		count = s.getEstimatedTableCount(tableName)
+	} else {
+		// Use exact count for smaller tables
+		if err := s.db.Table(tableName).Where(condition, args...).Count(&count).Error; err != nil {
+			return 0, utils.WrapError(err, "failed to get count")
+		}
+	}
+
+	// Cache count
+	s.cacheService.Set(cacheKey, count, MediumCacheDuration)
+
+	return count, nil
+}
+
+// Helper methods
+
+type UserStats struct {
+	UserID          string `json:"user_id"`
+	DogCount        int64  `json:"dog_count"`
+	PostCount       int64  `json:"post_count"`
+	LikesReceived   int64  `json:"likes_received"`
+	FollowersCount  int64  `json:"followers_count"`
+	FollowingCount  int64  `json:"following_count"`
+	EncounterCount  int64  `json:"encounter_count"`
+	GiftsReceived   int64  `json:"gifts_received"`
+	GiftsSent       int64  `json:"gifts_sent"`
+}
+
+func (s *QueryOptimizationService) searchPosts(query string, limit int, offset int, cacheKey string) ([]models.Post, int64, error) {
+	type PostSearchResult struct {
+		Posts []models.Post `json:"posts"`
+		Total int64         `json:"total"`
+	}
+
+	var result PostSearchResult
+	if err := s.cacheService.Get(cacheKey, &result); err == nil {
+		return result.Posts, result.Total, nil
+	}
+
+	searchQuery := "%" + strings.ToLower(query) + "%"
+
+	// Count total results
+	var total int64
+	if err := s.db.Model(&models.Post{}).
+		Where("is_public = true AND (LOWER(content) LIKE ? OR ? = ANY(hashtags))", searchQuery, query).
+		Count(&total).Error; err != nil {
+		return nil, 0, utils.WrapError(err, "failed to count posts")
+	}
+
+	// Get posts
+	var posts []models.Post
+	if err := s.db.Preload("Dog", func(db *gorm.DB) *gorm.DB {
+		return db.Select("id, name, profile_photo, user_id")
+	}).Where("is_public = true AND (LOWER(content) LIKE ? OR ? = ANY(hashtags))", searchQuery, query).
+		Order("created_at DESC").
+		Limit(limit).Offset(offset).
+		Find(&posts).Error; err != nil {
+		return nil, 0, utils.WrapError(err, "failed to search posts")
+	}
+
+	// Cache result
+	result = PostSearchResult{Posts: posts, Total: total}
+	s.cacheService.Set(cacheKey, result, ShortCacheDuration)
+
+	return posts, total, nil
+}
+
+func (s *QueryOptimizationService) searchDogs(query string, limit int, offset int, cacheKey string) ([]models.Dog, int64, error) {
+	type DogSearchResult struct {
+		Dogs  []models.Dog `json:"dogs"`
+		Total int64        `json:"total"`
+	}
+
+	var result DogSearchResult
+	if err := s.cacheService.Get(cacheKey, &result); err == nil {
+		return result.Dogs, result.Total, nil
+	}
+
+	searchQuery := "%" + strings.ToLower(query) + "%"
+
+	// Count total results
+	var total int64
+	if err := s.db.Model(&models.Dog{}).
+		Where("is_public = true AND LOWER(name) LIKE ?", searchQuery).
+		Count(&total).Error; err != nil {
+		return nil, 0, utils.WrapError(err, "failed to count dogs")
+	}
+
+	// Get dogs
+	var dogs []models.Dog
+	if err := s.db.Where("is_public = true AND LOWER(name) LIKE ?", searchQuery).
+		Order("name ASC").
+		Limit(limit).Offset(offset).
+		Find(&dogs).Error; err != nil {
+		return nil, 0, utils.WrapError(err, "failed to search dogs")
+	}
+
+	// Cache result
+	result = DogSearchResult{Dogs: dogs, Total: total}
+	s.cacheService.Set(cacheKey, result, ShortCacheDuration)
+
+	return dogs, total, nil
+}
+
+func (s *QueryOptimizationService) searchUsers(query string, limit int, offset int, cacheKey string) ([]models.User, int64, error) {
+	type UserSearchResult struct {
+		Users []models.User `json:"users"`
+		Total int64         `json:"total"`
+	}
+
+	var result UserSearchResult
+	if err := s.cacheService.Get(cacheKey, &result); err == nil {
+		return result.Users, result.Total, nil
+	}
+
+	searchQuery := "%" + strings.ToLower(query) + "%"
+
+	// Count total results
+	var total int64
+	if err := s.db.Model(&models.User{}).
+		Where("LOWER(nickname) LIKE ?", searchQuery).
+		Count(&total).Error; err != nil {
+		return nil, 0, utils.WrapError(err, "failed to count users")
+	}
+
+	// Get users
+	var users []models.User
+	if err := s.db.Select("id, nickname, profile_image, created_at").
+		Where("LOWER(nickname) LIKE ?", searchQuery).
+		Order("nickname ASC").
+		Limit(limit).Offset(offset).
+		Find(&users).Error; err != nil {
+		return nil, 0, utils.WrapError(err, "failed to search users")
+	}
+
+	// Cache result
+	result = UserSearchResult{Users: users, Total: total}
+	s.cacheService.Set(cacheKey, result, ShortCacheDuration)
+
+	return users, total, nil
+}
+
+func (s *QueryOptimizationService) isLargeTable(tableName string) bool {
+	// Define large tables that should use estimated counts
+	largeTables := []string{"posts", "likes", "comments", "encounters", "gift_histories"}
+	for _, table := range largeTables {
+		if table == tableName {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *QueryOptimizationService) getEstimatedTableCount(tableName string) int64 {
+	// Use PostgreSQL statistics for estimated count
+	var count int64
+	query := `
+		SELECT reltuples::BIGINT AS approximate_row_count
+		FROM pg_class
+		WHERE relname = ?
+	`
+	s.db.Raw(query, tableName).Scan(&count)
+	return count
+}
+
+// Cache invalidation methods
+func (s *QueryOptimizationService) InvalidateUserCache(userID string) error {
+	patterns := []string{
+		fmt.Sprintf("user_profile:%s", userID),
+		fmt.Sprintf("user_with_dogs:%s", userID),
+		fmt.Sprintf("user_stats:%s", userID),
+		fmt.Sprintf("timeline:%s:*", userID),
+		fmt.Sprintf("timeline_total:%s", userID),
+	}
+
+	for _, pattern := range patterns {
+		if strings.Contains(pattern, "*") {
+			s.cacheService.DeletePattern(pattern)
+		} else {
+			s.cacheService.Delete(pattern)
+		}
+	}
+
+	return nil
+}
+
+func (s *QueryOptimizationService) InvalidatePostCache(postID string) error {
+	patterns := []string{
+		fmt.Sprintf("post:%s", postID),
+		"timeline:*",
+		"popular_posts:*",
+		"search:posts:*",
+	}
+
+	for _, pattern := range patterns {
+		s.cacheService.DeletePattern(pattern)
+	}
+
+	return nil
+}

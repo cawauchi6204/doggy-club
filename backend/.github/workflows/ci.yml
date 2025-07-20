@@ -1,0 +1,403 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+
+env:
+  GO_VERSION: 1.21
+
+jobs:
+  # Code quality checks
+  quality:
+    name: Code Quality
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Go
+      uses: actions/setup-go@v4
+      with:
+        go-version: ${{ env.GO_VERSION }}
+
+    - name: Cache Go modules
+      uses: actions/cache@v3
+      with:
+        path: ~/go/pkg/mod
+        key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+        restore-keys: |
+          ${{ runner.os }}-go-
+
+    - name: Download dependencies
+      run: make deps
+
+    - name: Format check
+      run: |
+        make fmt
+        if [ -n "$(git diff --exit-code)" ]; then
+          echo "Code is not formatted. Run 'make fmt'"
+          exit 1
+        fi
+
+    - name: Vet
+      run: make vet
+
+    - name: Lint
+      run: |
+        go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest
+        make lint
+
+    - name: Security scan
+      run: |
+        go install github.com/securecodewarrior/gosec/v2/cmd/gosec@latest
+        make security
+
+  # Unit tests
+  unit-tests:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    needs: quality
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Go
+      uses: actions/setup-go@v4
+      with:
+        go-version: ${{ env.GO_VERSION }}
+
+    - name: Cache Go modules
+      uses: actions/cache@v3
+      with:
+        path: ~/go/pkg/mod
+        key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+        restore-keys: |
+          ${{ runner.os }}-go-
+
+    - name: Download dependencies
+      run: make deps
+
+    - name: Run unit tests
+      run: make test-unit
+
+  # Integration tests
+  integration-tests:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    needs: quality
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_DB: doggyclub_test
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: password
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+      redis:
+        image: redis:7
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 6379:6379
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Go
+      uses: actions/setup-go@v4
+      with:
+        go-version: ${{ env.GO_VERSION }}
+
+    - name: Cache Go modules
+      uses: actions/cache@v3
+      with:
+        path: ~/go/pkg/mod
+        key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+        restore-keys: |
+          ${{ runner.os }}-go-
+
+    - name: Download dependencies
+      run: make deps
+
+    - name: Wait for PostgreSQL
+      run: |
+        until pg_isready -h localhost -p 5432 -U postgres; do
+          echo "Waiting for PostgreSQL..."
+          sleep 2
+        done
+
+    - name: Run integration tests
+      env:
+        TEST_DB_HOST: localhost
+        TEST_DB_PORT: 5432
+        TEST_DB_NAME: doggyclub_test
+        TEST_DB_USER: postgres
+        TEST_DB_PASSWORD: password
+        TEST_REDIS_HOST: localhost
+        TEST_REDIS_PORT: 6379
+      run: make test-integration
+
+  # Coverage tests
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-latest
+    needs: [unit-tests, integration-tests]
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_DB: doggyclub_test
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: password
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+      redis:
+        image: redis:7
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 6379:6379
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Go
+      uses: actions/setup-go@v4
+      with:
+        go-version: ${{ env.GO_VERSION }}
+
+    - name: Cache Go modules
+      uses: actions/cache@v3
+      with:
+        path: ~/go/pkg/mod
+        key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+        restore-keys: |
+          ${{ runner.os }}-go-
+
+    - name: Download dependencies
+      run: make deps
+
+    - name: Run tests with coverage
+      env:
+        TEST_DB_HOST: localhost
+        TEST_DB_PORT: 5432
+        TEST_DB_NAME: doggyclub_test
+        TEST_DB_USER: postgres
+        TEST_DB_PASSWORD: password
+        TEST_REDIS_HOST: localhost
+        TEST_REDIS_PORT: 6379
+      run: make test-coverage
+
+    - name: Upload coverage to Codecov
+      uses: codecov/codecov-action@v3
+      with:
+        file: ./coverage.out
+        flags: unittests
+        name: codecov-umbrella
+        fail_ci_if_error: true
+
+  # Build tests
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    needs: quality
+    strategy:
+      matrix:
+        os: [linux, darwin]
+        arch: [amd64, arm64]
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Go
+      uses: actions/setup-go@v4
+      with:
+        go-version: ${{ env.GO_VERSION }}
+
+    - name: Cache Go modules
+      uses: actions/cache@v3
+      with:
+        path: ~/go/pkg/mod
+        key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+        restore-keys: |
+          ${{ runner.os }}-go-
+
+    - name: Download dependencies
+      run: make deps
+
+    - name: Build
+      env:
+        GOOS: ${{ matrix.os }}
+        GOARCH: ${{ matrix.arch }}
+      run: |
+        mkdir -p bin
+        go build -o bin/doggyclub-backend-${{ matrix.os }}-${{ matrix.arch }} ./cmd/api
+
+    - name: Upload build artifacts
+      uses: actions/upload-artifact@v3
+      with:
+        name: doggyclub-backend-${{ matrix.os }}-${{ matrix.arch }}
+        path: bin/doggyclub-backend-${{ matrix.os }}-${{ matrix.arch }}
+
+  # Docker build
+  docker-build:
+    name: Docker Build
+    runs-on: ubuntu-latest
+    needs: [unit-tests, integration-tests]
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Login to Container Registry
+      if: github.event_name != 'pull_request'
+      uses: docker/login-action@v3
+      with:
+        registry: ghcr.io
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Extract metadata
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ghcr.io/${{ github.repository }}
+        tags: |
+          type=ref,event=branch
+          type=ref,event=pr
+          type=sha,prefix={{branch}}-
+
+    - name: Build and push Docker image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        platforms: linux/amd64,linux/arm64
+        push: ${{ github.event_name != 'pull_request' }}
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+
+  # Performance tests (only on main branch)
+  performance:
+    name: Performance Tests
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    needs: [unit-tests, integration-tests]
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_DB: doggyclub_test
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: password
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+      redis:
+        image: redis:7
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 6379:6379
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Go
+      uses: actions/setup-go@v4
+      with:
+        go-version: ${{ env.GO_VERSION }}
+
+    - name: Cache Go modules
+      uses: actions/cache@v3
+      with:
+        path: ~/go/pkg/mod
+        key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+        restore-keys: |
+          ${{ runner.os }}-go-
+
+    - name: Download dependencies
+      run: make deps
+
+    - name: Run benchmark tests
+      env:
+        TEST_DB_HOST: localhost
+        TEST_DB_PORT: 5432
+        TEST_DB_NAME: doggyclub_test
+        TEST_DB_USER: postgres
+        TEST_DB_PASSWORD: password
+        TEST_REDIS_HOST: localhost
+        TEST_REDIS_PORT: 6379
+      run: make test-benchmark
+
+  # Deployment (only on main branch)
+  deploy:
+    name: Deploy
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    needs: [coverage, build, docker-build, performance]
+    environment: production
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Deploy to production
+      run: |
+        echo "Deployment would happen here"
+        # This would integrate with your deployment platform
+        # For example: Heroku, AWS, Google Cloud, etc.
+
+  # Notification
+  notify:
+    name: Notify
+    runs-on: ubuntu-latest
+    if: always()
+    needs: [quality, unit-tests, integration-tests, coverage, build, docker-build]
+    steps:
+    - name: Notify on success
+      if: ${{ needs.quality.result == 'success' && needs.unit-tests.result == 'success' && needs.integration-tests.result == 'success' }}
+      run: |
+        echo "✅ All tests passed!"
+        # You could add Slack/Discord/email notifications here
+
+    - name: Notify on failure
+      if: ${{ needs.quality.result == 'failure' || needs.unit-tests.result == 'failure' || needs.integration-tests.result == 'failure' }}
+      run: |
+        echo "❌ Some tests failed!"
+        # You could add Slack/Discord/email notifications here

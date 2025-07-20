@@ -1,0 +1,358 @@
+package middleware
+
+import (
+	"bytes"
+	"crypto/md5"
+	"fmt"
+	"io"
+	"net/http"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/doggyclub/backend/pkg/services"
+	"github.com/labstack/echo/v4"
+)
+
+type CacheMiddleware struct {
+	cacheService *services.CacheService
+}
+
+func NewCacheMiddleware(cacheService *services.CacheService) *CacheMiddleware {
+	return &CacheMiddleware{
+		cacheService: cacheService,
+	}
+}
+
+// CacheResponse caches HTTP responses for specified duration
+func (cm *CacheMiddleware) CacheResponse(duration time.Duration) echo.MiddlewareFunc {
+	return func(next echo.HandlerFunc) echo.HandlerFunc {
+		return func(c echo.Context) error {
+			// Skip caching for non-GET requests
+			if c.Request().Method != http.MethodGet {
+				return next(c)
+			}
+
+			// Generate cache key based on URL and query parameters
+			cacheKey := cm.generateCacheKey(c)
+
+			// Try to get cached response
+			var cachedResponse CachedResponse
+			err := cm.cacheService.Get(cacheKey, &cachedResponse)
+			if err == nil {
+				// Return cached response
+				for key, value := range cachedResponse.Headers {
+					c.Response().Header().Set(key, value)
+				}
+				c.Response().Header().Set("X-Cache", "HIT")
+				return c.Blob(cachedResponse.StatusCode, cachedResponse.ContentType, cachedResponse.Body)
+			}
+
+			// Create a response recorder to capture the response
+			rec := &ResponseRecorder{
+				ResponseWriter: c.Response().Writer,
+				statusCode:     http.StatusOK,
+				headers:        make(map[string]string),
+				body:           &bytes.Buffer{},
+			}
+
+			// Replace the response writer
+			c.Response().Writer = rec
+
+			// Process the request
+			if err := next(c); err != nil {
+				return err
+			}
+
+			// Cache the response if it's successful
+			if rec.statusCode >= 200 && rec.statusCode < 300 {
+				responseToCache := CachedResponse{
+					StatusCode:  rec.statusCode,
+					ContentType: rec.headers["Content-Type"],
+					Headers:     rec.headers,
+					Body:        rec.body.Bytes(),
+					CachedAt:    time.Now(),
+				}
+
+				// Cache the response (ignore errors to avoid breaking the request)
+				cm.cacheService.Set(cacheKey, responseToCache, duration)
+			}
+
+			// Set cache header
+			c.Response().Header().Set("X-Cache", "MISS")
+
+			return nil
+		}
+	}
+}
+
+// Conditional caching middleware that only caches specific endpoints
+func (cm *CacheMiddleware) ConditionalCache() echo.MiddlewareFunc {
+	return func(next echo.HandlerFunc) echo.HandlerFunc {
+		return func(c echo.Context) error {
+			path := c.Request().URL.Path
+			
+			// Define cacheable endpoints and their durations
+			cacheRules := map[string]time.Duration{
+				"/api/gifts/catalog":        30 * time.Minute,
+				"/api/gifts/rankings":       15 * time.Minute,
+				"/api/subscriptions/plans":  1 * time.Hour,
+				"/api/posts/search":         5 * time.Minute,
+			}
+
+			// Check if current path should be cached
+			for pattern, duration := range cacheRules {
+				if strings.HasPrefix(path, pattern) {
+					return cm.CacheResponse(duration)(next)(c)
+				}
+			}
+
+			// No caching for this endpoint
+			return next(c)
+		}
+	}
+}
+
+// ETags middleware for conditional requests
+func (cm *CacheMiddleware) ETagMiddleware() echo.MiddlewareFunc {
+	return func(next echo.HandlerFunc) echo.HandlerFunc {
+		return func(c echo.Context) error {
+			// Skip for non-GET requests
+			if c.Request().Method != http.MethodGet {
+				return next(c)
+			}
+
+			// Create a response recorder to capture the response
+			rec := &ResponseRecorder{
+				ResponseWriter: c.Response().Writer,
+				statusCode:     http.StatusOK,
+				headers:        make(map[string]string),
+				body:           &bytes.Buffer{},
+			}
+
+			// Replace the response writer
+			originalWriter := c.Response().Writer
+			c.Response().Writer = rec
+
+			// Process the request
+			err := next(c)
+			if err != nil {
+				c.Response().Writer = originalWriter
+				return err
+			}
+
+			// Generate ETag from response body
+			etag := cm.generateETag(rec.body.Bytes())
+			
+			// Check if client has the same ETag
+			clientETag := c.Request().Header.Get("If-None-Match")
+			if clientETag == etag {
+				// Content hasn't changed, return 304 Not Modified
+				c.Response().Writer = originalWriter
+				return c.NoContent(http.StatusNotModified)
+			}
+
+			// Set ETag header and return the response
+			c.Response().Writer = originalWriter
+			c.Response().Header().Set("ETag", etag)
+			
+			// Copy headers
+			for key, value := range rec.headers {
+				c.Response().Header().Set(key, value)
+			}
+
+			// Write the response
+			c.Response().WriteHeader(rec.statusCode)
+			_, err = c.Response().Writer.Write(rec.body.Bytes())
+			return err
+		}
+	}
+}
+
+// Rate limiting middleware using cache service
+func (cm *CacheMiddleware) RateLimitMiddleware(requests int, window time.Duration) echo.MiddlewareFunc {
+	return func(next echo.HandlerFunc) echo.HandlerFunc {
+		return func(c echo.Context) error {
+			// Get client identifier (IP address or user ID)
+			clientID := c.RealIP()
+			if userID := GetUserID(c); userID != "" {
+				clientID = "user:" + userID
+			}
+
+			// Create rate limit key
+			rateLimitKey := fmt.Sprintf("rate_limit:%s", clientID)
+
+			// Check rate limit
+			allowed, err := cm.cacheService.CheckRateLimit(rateLimitKey, requests, window)
+			if err != nil {
+				// Log error but don't block the request
+				fmt.Printf("Rate limit check failed: %v\n", err)
+				return next(c)
+			}
+
+			if !allowed {
+				return c.JSON(http.StatusTooManyRequests, map[string]string{
+					"error": "Rate limit exceeded",
+					"retry_after": strconv.Itoa(int(window.Seconds())),
+				})
+			}
+
+			return next(c)
+		}
+	}
+}
+
+// Helper types and functions
+
+type CachedResponse struct {
+	StatusCode  int               `json:"status_code"`
+	ContentType string            `json:"content_type"`
+	Headers     map[string]string `json:"headers"`
+	Body        []byte            `json:"body"`
+	CachedAt    time.Time         `json:"cached_at"`
+}
+
+type ResponseRecorder struct {
+	http.ResponseWriter
+	statusCode int
+	headers    map[string]string
+	body       *bytes.Buffer
+}
+
+func (r *ResponseRecorder) WriteHeader(statusCode int) {
+	r.statusCode = statusCode
+	r.ResponseWriter.WriteHeader(statusCode)
+}
+
+func (r *ResponseRecorder) Write(data []byte) (int, error) {
+	// Capture response body
+	r.body.Write(data)
+	
+	// Capture headers
+	for key, values := range r.ResponseWriter.Header() {
+		if len(values) > 0 {
+			r.headers[key] = values[0]
+		}
+	}
+	
+	// Write to actual response
+	return r.ResponseWriter.Write(data)
+}
+
+func (r *ResponseRecorder) Header() http.Header {
+	return r.ResponseWriter.Header()
+}
+
+func (cm *CacheMiddleware) generateCacheKey(c echo.Context) string {
+	// Include method, path, query parameters, and user ID for personalized caching
+	var keyParts []string
+	
+	keyParts = append(keyParts, c.Request().Method)
+	keyParts = append(keyParts, c.Request().URL.Path)
+	
+	if c.Request().URL.RawQuery != "" {
+		keyParts = append(keyParts, c.Request().URL.RawQuery)
+	}
+	
+	// Include user ID for personalized content
+	if userID := GetUserID(c); userID != "" {
+		keyParts = append(keyParts, "user:"+userID)
+	}
+	
+	key := strings.Join(keyParts, "|")
+	
+	// Hash the key to keep it short and consistent
+	hash := md5.Sum([]byte(key))
+	return fmt.Sprintf("api_cache:%x", hash)
+}
+
+func (cm *CacheMiddleware) generateETag(data []byte) string {
+	hash := md5.Sum(data)
+	return fmt.Sprintf(`"%x"`, hash)
+}
+
+// Cache invalidation middleware
+func (cm *CacheMiddleware) InvalidateCache(patterns ...string) echo.MiddlewareFunc {
+	return func(next echo.HandlerFunc) echo.HandlerFunc {
+		return func(c echo.Context) error {
+			// Process the request first
+			err := next(c)
+			
+			// If request was successful and modifies data, invalidate related caches
+			if err == nil && (c.Request().Method == "POST" || 
+				c.Request().Method == "PUT" || 
+				c.Request().Method == "DELETE") {
+				
+				// Invalidate cache patterns
+				for _, pattern := range patterns {
+					cm.cacheService.DeletePattern(pattern)
+				}
+			}
+			
+			return err
+		}
+	}
+}
+
+// Compress response middleware
+func CompressResponse() echo.MiddlewareFunc {
+	return func(next echo.HandlerFunc) echo.HandlerFunc {
+		return func(c echo.Context) error {
+			// Check if client accepts compression
+			if !strings.Contains(c.Request().Header.Get("Accept-Encoding"), "gzip") {
+				return next(c)
+			}
+
+			// Set compression headers
+			c.Response().Header().Set("Content-Encoding", "gzip")
+			c.Response().Header().Set("Vary", "Accept-Encoding")
+
+			// Create gzip writer
+			gzipWriter := &GzipResponseWriter{
+				ResponseWriter: c.Response().Writer,
+			}
+			c.Response().Writer = gzipWriter
+
+			// Process request
+			err := next(c)
+			
+			// Close gzip writer
+			if err := gzipWriter.Close(); err != nil {
+				return err
+			}
+
+			return err
+		}
+	}
+}
+
+// Gzip response writer
+type GzipResponseWriter struct {
+	http.ResponseWriter
+	writer io.WriteCloser
+}
+
+func (g *GzipResponseWriter) Write(data []byte) (int, error) {
+	if g.writer == nil {
+		// Initialize gzip writer on first write
+		buf := &bytes.Buffer{}
+		g.writer = &bufferWriteCloser{buf} // Wrapper to implement WriteCloser
+	}
+	return g.writer.Write(data)
+}
+
+func (g *GzipResponseWriter) Close() error {
+	if g.writer != nil {
+		return g.writer.Close()
+	}
+	return nil
+}
+
+// bufferWriteCloser wraps bytes.Buffer to implement io.WriteCloser
+type bufferWriteCloser struct {
+	*bytes.Buffer
+}
+
+func (bwc *bufferWriteCloser) Close() error {
+	return nil // No-op for bytes.Buffer
+}
