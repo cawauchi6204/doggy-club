@@ -49,10 +49,10 @@ dependencies:
   flutter_secure_storage: ^9.0.0
   shared_preferences: ^2.2.2
   
-  # Location & Maps
-  geolocator: ^10.1.0
-  google_maps_flutter: ^2.5.3
-  permission_handler: ^11.1.0
+  # Location & Maps - Temporarily disabled for iOS build issues
+  # geolocator: ^10.1.0
+  # google_maps_flutter: ^2.5.3
+  # permission_handler: ^11.1.0
   
   # Bluetooth
   flutter_blue_plus: ^1.31.4
@@ -62,13 +62,13 @@ dependencies:
   cached_network_image: ^3.3.1
   video_player: ^2.8.2
   
-  # Firebase
-  firebase_core: ^2.24.2
-  firebase_messaging: ^14.7.10
-  firebase_auth: ^4.16.0
+  # Firebase - Temporarily disabled for iOS build issues
+  # firebase_core: ^2.24.2
+  # firebase_messaging: ^14.7.10
+  # firebase_auth: ^4.16.0
   
   # Payments
-  flutter_stripe: ^9.5.0+1
+  # flutter_stripe: ^9.5.0+1  # Temporarily disabled for iOS build issues
   
   # Utilities
   json_annotation: ^4.8.1
